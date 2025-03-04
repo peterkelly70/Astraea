@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from transformers import AutoTokenizer, AutoModel
+from helpers.life_long_learning import log_interaction, nightly_update
 
 # -----------------------------
 # Initialize the GPT-2 tokenizer (for text encoder and decoding)
@@ -226,14 +227,19 @@ def run_interactive(model, decoder, text_encoder):
 def run_test(model, decoder, text_encoder):
     test_questions = [
         "Hello",
-        "Can you help me?",
-        "That's odd",
+        "What is the capital of Australia?",
+        "Who is the presiunt of the united states of america?",
+        "Why is the sky blue?",
+        "When was the Battle of Hastings?",
         "2+2",
         "5+1",
         "3-1",
+        "6-8",
         "2*2",
-        "2/2",
-        "What is the capital of Australia?"
+        "5*5",
+        "144*12",
+        "2/2"
+        
     ]
     print("\nThe following test questions will be run:")
     for i, q in enumerate(test_questions, start=1):
