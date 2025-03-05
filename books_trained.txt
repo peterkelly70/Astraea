@@ -1,3 +1,5 @@
 21076-t.tex
 LogicalPragmatism.txt
 28696.txt
+35420.txt
+41568-t.tex

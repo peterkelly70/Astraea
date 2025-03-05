@@ -9,6 +9,7 @@ This script offers multiple training modules for the Astraea student model:
   5: RL Fine-Tuning (uses REINFORCE with a reward based on teacher QA data)
   6: Exit
   7: Do All Modules
+  8: Pretrain Decoder
 
 After each training module, the script logs a training entry to "training_log.txt".
 For book training, processed book filenames are recorded in "books_trained.txt".
@@ -42,7 +43,7 @@ if tokenizer.eos_token is None:
     tokenizer.eos_token = ""
 
 # -----------------------------
-# Helper: Ternary Quantization
+# Helper: Ternary Quantization (Not actively used here)
 # -----------------------------
 def quantize_to_ternary(w, scale=1.0):
     thresh = scale * torch.mean(torch.abs(w))
@@ -171,22 +172,66 @@ def load_teacher_qa_data(filename="teacher_qa.json"):
         print("Teacher QA data not found locally. Downloading full training splits from Hugging Face...")
         nq = load_dataset("natural_questions", split="train")
         tq = load_dataset("trivia_qa", "rc", split="train")
-        hp = load_dataset("hotpot_qa", "fullwiki", split="train")
+        hp = load_dataset("hotpot_qa", "fullwiki", split="train", trust_remote_code=True)
         data = []
-        for item in nq:
-            if len(item["answers"]["text"]) > 0:
+        print("Processing Natural Questions data...")
+        for item in tqdm(nq, desc="Natural Questions"):
+            if "answers" in item and len(item["answers"]["text"]) > 0:
                 answer = item["answers"]["text"][0]
             else:
-                answer = "Unanswerable"
-            data.append({"question": item["question"], "answer": answer})
-        for item in tq:
-            data.append({"question": item["question"], "answer": item["answer"]["value"]})
-        for item in hp:
-            data.append({"question": item["question"], "answer": item["answer"]})
+                answer = item.get("answer", "Unanswerable")
+            data.append({"question": str(item["question"]), "answer": str(answer)})
+        print("Processing TriviaQA data...")
+        for item in tqdm(tq, desc="TriviaQA"):
+            data.append({"question": str(item["question"]), "answer": str(item["answer"]["value"])})
+        print("Processing HotpotQA data...")
+        for item in tqdm(hp, desc="HotpotQA"):
+            data.append({"question": str(item["question"]), "answer": str(item.get("answer", "Unanswerable"))})
         df = pd.DataFrame(data)
         df.to_json(filename, orient="records")
         print(f"Downloaded teacher QA data and saved to {filename} with {len(df)} records.")
         return df
+
+# -----------------------------
+# Pretrain Decoder (Optional)
+# -----------------------------
+def pretrain_decoder(decoder, text_file="pretrain_text.txt", epochs=5, batch_size=32):
+    """
+    Pretrain the decoder on a text corpus to improve language fluency.
+    This function assumes the text_file contains clean, newline-separated text samples.
+    """
+    if not os.path.exists(text_file):
+        print(f"Pretraining text file {text_file} not found.")
+        return
+    print("Loading pretraining data...")
+    with open(text_file, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    # Tokenize all lines
+    encodings = tokenizer(lines, return_tensors="pt", padding=True, truncation=True)
+    input_ids = encodings["input_ids"].to(device)
+    optimizer = optim.Adam(decoder.parameters(), lr=0.001)
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100)
+    decoder.train()
+    num_batches = len(input_ids) // batch_size
+    print("Starting decoder pretraining...")
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for i in tqdm(range(num_batches), desc=f"Pretraining Epoch {epoch+1}"):
+            batch_ids = input_ids[i*batch_size:(i+1)*batch_size]
+            # Shift inputs to create targets
+            inputs = batch_ids[:, :-1]
+            targets = batch_ids[:, 1:]
+            # Use a dummy student embedding (zeros) to initialize hidden state via decoder.init_fc
+            dummy_embedding = torch.zeros((batch_ids.size(0), 32), device=device)
+            logits = decoder(dummy_embedding, inputs)
+            loss = ce_criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        print(f"Pretraining Epoch {epoch+1}: Loss = {epoch_loss/num_batches:.4f}")
+    decoder.eval()
+    print("Decoder pretraining completed.")
 
 # -----------------------------
 # Load Student Model and Decoder Functions
@@ -336,13 +381,13 @@ def train_on_squad(model, num_epochs=5, batch_size=32):
             batch = df.sample(batch_size)
             questions = batch["question"].tolist()
             answers = batch["answer"].tolist()
-            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=q)["embedding"] for q in questions]
+            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(q))["embedding"] for q in questions]
             q_embeds = torch.tensor(q_embeds, dtype=torch.float32)
             if q_embeds.ndim == 1:
                 q_embeds = q_embeds.unsqueeze(0)
             q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
             inputs = proj_in_layer(q_embeds).to(device)
-            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=a)["embedding"] for a in answers]
+            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(a))["embedding"] for a in answers]
             a_embeds = torch.tensor(a_embeds, dtype=torch.float32).to(device)
             if a_embeds.ndim == 1:
                 a_embeds = a_embeds.unsqueeze(0)
@@ -380,13 +425,13 @@ def train_on_arithmetic(model, num_epochs=5, batch_size=32):
                     a_text = str(eval(q))
                 questions.append(q)
                 answers.append(a_text)
-            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=q)["embedding"] for q in questions]
+            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(q))["embedding"] for q in questions]
             q_embeds = torch.tensor(q_embeds, dtype=torch.float32)
             if q_embeds.ndim == 1:
                 q_embeds = q_embeds.unsqueeze(0)
             q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
             inputs = proj_in_layer(q_embeds).to(device)
-            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=a)["embedding"] for a in answers]
+            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(a))["embedding"] for a in answers]
             a_embeds = torch.tensor(a_embeds, dtype=torch.float32).to(device)
             if a_embeds.ndim == 1:
                 a_embeds = a_embeds.unsqueeze(0)
@@ -415,7 +460,6 @@ def train_on_book_file(model, book_path, num_epochs=5, batch_size=16):
             except ImportError:
                 print("pylatexenc not installed; proceeding without LaTeX conversion.")
         paragraphs = content.split("\n\n")
-        # Filter out empty or whitespace-only paragraphs
         paragraphs = [p.strip() for p in paragraphs if len(p.strip()) > 50]
         if not paragraphs:
             print(f"No valid paragraphs found in {book_path}. Skipping training for this book.")
@@ -429,18 +473,16 @@ def train_on_book_file(model, book_path, num_epochs=5, batch_size=16):
     with tqdm(total=num_epochs, desc=f"Book Training ({os.path.basename(book_path)})", unit="epoch") as pbar:
         for epoch in range(num_epochs):
             batch = random.sample(paragraphs, min(batch_size, len(paragraphs)))
-            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=p)["embedding"] for p in batch]
+            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(p))["embedding"] for p in batch]
             q_embeds = torch.tensor(q_embeds, dtype=torch.float32)
-            # Ensure tensor is 2D
             if q_embeds.ndim == 1:
                 q_embeds = q_embeds.unsqueeze(0)
             q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
             inputs = proj_in_layer(q_embeds).to(device)
-            # Use proj_out_layer to produce a 32-dim target
             targets = proj_out_layer(q_embeds).to(device)
             targets = targets / targets.norm(dim=1, keepdim=True)
             optimizer.zero_grad()
-            outputs = model(inputs)  # [batch, 32]
+            outputs = model(inputs)
             outputs = outputs / outputs.norm(dim=1, keepdim=True)
             loss = criterion(outputs, targets)
             loss.backward()
@@ -472,6 +514,9 @@ def train_free_text_qa(model, decoder, num_epochs=5, batch_size=32, lambda_embed
             batch = df.sample(batch_size)
             questions = batch["question"].tolist()
             answers = batch["answer"].tolist()
+            # Ensure all inputs are strings
+            questions = [str(q) for q in questions]
+            answers = [str(a) for a in answers]
             q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=q)["embedding"] for q in questions]
             q_embeds = torch.tensor(q_embeds, dtype=torch.float32)
             if q_embeds.ndim == 1:
@@ -485,7 +530,7 @@ def train_free_text_qa(model, decoder, num_epochs=5, batch_size=32, lambda_embed
             target_ids = target_encodings["input_ids"].to(device)
             logits = decoder(student_out, target_ids[:, :-1])
             loss_ce = ce_criterion(logits.reshape(-1, logits.size(-1)), target_ids[:, 1:].reshape(-1))
-            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=a)["embedding"] for a in answers]
+            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(a))["embedding"] for a in answers]
             a_embeds = torch.tensor(a_embeds, dtype=torch.float32).to(device)
             if a_embeds.ndim == 1:
                 a_embeds = a_embeds.unsqueeze(0)
@@ -511,6 +556,8 @@ def train_rl_finetune(model, decoder, text_encoder, num_epochs=5, batch_size=16)
         questions = batch["question"].tolist()
         ground_truths = batch["answer"].tolist()
         for q, gt in zip(questions, ground_truths):
+            q = str(q)
+            gt = str(gt)
             encoding = tokenizer(q, return_tensors="pt")
             teacher_embed = text_encoder(encoding["input_ids"], attention_mask=encoding.get("attention_mask"))
             teacher_embed = teacher_embed.squeeze(0)
@@ -564,6 +611,7 @@ def main_menu():
     print("5: RL Fine-Tuning")
     print("6: Exit")
     print("7: Do All Modules")
+    print("8: Pretrain Decoder")
     choice = input("Enter module number: ")
     return choice.strip()
 
@@ -603,6 +651,10 @@ if __name__ == "__main__":
             train_on_all_unseen_books(student_model, num_epochs=5, batch_size=16)
             train_free_text_qa(student_model, load_decoder(), num_epochs=5, batch_size=32, lambda_embed=0.5)
             train_rl_finetune(student_model, load_decoder(), load_text_encoder(), num_epochs=5, batch_size=16)
+        elif choice == "8":
+            print("Pretraining the decoder on pretrain_text.txt...")
+            decoder = load_decoder()
+            pretrain_decoder(decoder, text_file="pretrain_text.txt", epochs=5, batch_size=32)
         elif choice == "6":
             print("Exiting training module.")
             break
