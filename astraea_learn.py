@@ -1,5 +1,5 @@
 """
-Astraea Learning Script (Updated)
+Astraea Learning Script (Updated to Use GPT-2 Teacher Embeddings)
 
 This script offers multiple training modules for the Astraea student model:
   1: SQuAD Fine-Tuning (embedding-only distillation)
@@ -13,7 +13,7 @@ This script offers multiple training modules for the Astraea student model:
 
 After each training module, the script logs a training entry to "training_log.txt".
 For book training, processed book filenames are recorded in "books_trained.txt".
-This allows you to continue training later and know what modules have been completed.
+This allows you to continue training later and know which modules have been completed.
 """
 
 import os
@@ -28,7 +28,7 @@ import numpy as np
 import pandas as pd
 from datasets import load_dataset
 from tqdm import tqdm
-import ollama
+import ollama  # (no longer used for embeddings)
 from transformers import AutoTokenizer, AutoModel
 
 # -----------------------------
@@ -43,7 +43,7 @@ if tokenizer.eos_token is None:
     tokenizer.eos_token = ""
 
 # -----------------------------
-# Helper: Ternary Quantization (Not actively used here)
+# Helper: Ternary Quantization (Not actively used)
 # -----------------------------
 def quantize_to_ternary(w, scale=1.0):
     thresh = scale * torch.mean(torch.abs(w))
@@ -62,7 +62,6 @@ class AstraeaTernaryNet(nn.Module):
         self.fc4 = nn.Linear(hidden3, hidden4, bias=False)
         self.fc5 = nn.Linear(hidden4, output_size, bias=False)
         self.relu = nn.ReLU()
-        # Xavier initialization
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.xavier_uniform_(self.fc2.weight)
         nn.init.xavier_uniform_(self.fc3.weight)
@@ -86,7 +85,7 @@ class FreeTextDecoder(nn.Module):
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.lstm = nn.LSTM(embed_dim, hidden_dim, num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim, vocab_size)
-        self.init_fc = nn.Linear(32, hidden_dim)  # maps student embedding (32-dim) to LSTM hidden state
+        self.init_fc = nn.Linear(32, hidden_dim)  # maps student embedding (32-dim) to initial LSTM hidden state
         self.max_len = max_len
 
     def forward(self, student_embedding, target_ids):
@@ -117,7 +116,7 @@ class FreeTextDecoder(nn.Module):
         return generated
 
 # -----------------------------
-# Text Encoder: Standalone to Replace Teacher Model
+# Text Encoder: GPT-2 Based Teacher
 # -----------------------------
 class TextEncoder(nn.Module):
     def __init__(self, pretrained_model="gpt2", target_dim=4096):
@@ -138,9 +137,20 @@ def load_text_encoder():
     return encoder
 
 # -----------------------------
+# Helper: Get Teacher Embedding (Using GPT-2 Encoder)
+# -----------------------------
+def get_teacher_embedding(text, text_encoder):
+    encoding = tokenizer(text, return_tensors="pt")
+    embed = text_encoder(encoding["input_ids"], attention_mask=encoding.get("attention_mask"))
+    embed = embed.squeeze(0) if embed.ndim > 1 else embed
+    embed = embed / embed.norm()
+    return embed
+
+# -----------------------------
 # Global Projection Layers
 # -----------------------------
 device = torch.device("cpu")
+# These layers map the 4096-dim teacher embedding into the student input and target spaces.
 proj_in_layer = nn.Linear(4096, 1024, bias=False).to(device)
 nn.init.xavier_uniform_(proj_in_layer.weight)
 proj_out_layer = nn.Linear(4096, 32, bias=False).to(device)
@@ -193,47 +203,6 @@ def load_teacher_qa_data(filename="teacher_qa.json"):
         return df
 
 # -----------------------------
-# Pretrain Decoder (Optional)
-# -----------------------------
-def pretrain_decoder(decoder, text_file="pretrain_text.txt", epochs=5, batch_size=32):
-    """
-    Pretrain the decoder on a text corpus to improve language fluency.
-    This function assumes the text_file contains clean, newline-separated text samples.
-    """
-    if not os.path.exists(text_file):
-        print(f"Pretraining text file {text_file} not found.")
-        return
-    print("Loading pretraining data...")
-    with open(text_file, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
-    # Tokenize all lines
-    encodings = tokenizer(lines, return_tensors="pt", padding=True, truncation=True)
-    input_ids = encodings["input_ids"].to(device)
-    optimizer = optim.Adam(decoder.parameters(), lr=0.001)
-    ce_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100)
-    decoder.train()
-    num_batches = len(input_ids) // batch_size
-    print("Starting decoder pretraining...")
-    for epoch in range(epochs):
-        epoch_loss = 0.0
-        for i in tqdm(range(num_batches), desc=f"Pretraining Epoch {epoch+1}"):
-            batch_ids = input_ids[i*batch_size:(i+1)*batch_size]
-            # Shift inputs to create targets
-            inputs = batch_ids[:, :-1]
-            targets = batch_ids[:, 1:]
-            # Use a dummy student embedding (zeros) to initialize hidden state via decoder.init_fc
-            dummy_embedding = torch.zeros((batch_ids.size(0), 32), device=device)
-            logits = decoder(dummy_embedding, inputs)
-            loss = ce_criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-        print(f"Pretraining Epoch {epoch+1}: Loss = {epoch_loss/num_batches:.4f}")
-    decoder.eval()
-    print("Decoder pretraining completed.")
-
-# -----------------------------
 # Load Student Model and Decoder Functions
 # -----------------------------
 def load_student_model(checkpoint_path="astraea_distilled.pth"):
@@ -241,7 +210,7 @@ def load_student_model(checkpoint_path="astraea_distilled.pth"):
     model = AstraeaTernaryNet().to(device)
     if os.path.exists(checkpoint_path):
         try:
-            model.load_state_dict(torch.load(checkpoint_path, map_location=device, weights_only=True))
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
             model.eval()
             print(f"Loaded student model from {checkpoint_path}")
         except Exception as e:
@@ -261,10 +230,10 @@ def load_decoder():
 def process_query(model, decoder, text_encoder, query):
     """
     Processes a query:
-      - If arithmetic (only digits/operators), evaluates it.
-      - Otherwise, uses the text encoder to convert raw text into a 4096-dim embedding,
-        projects it to 1024-dim via proj_in_layer, passes it through the student model to get a 32-dim output,
-        and then uses the decoder to generate a free-form text response.
+      - If arithmetic, evaluates it.
+      - Otherwise, obtains a teacher embedding using GPT-2,
+        projects it to 1024-dim, passes through the student model to get a 32-dim vector,
+        and then uses the decoder to generate free-form text.
     """
     stripped = query.strip().replace(" ", "")
     if stripped.replace("+", "").replace("-", "").replace("*", "").replace("/", "").isdigit():
@@ -274,14 +243,13 @@ def process_query(model, decoder, text_encoder, query):
         except Exception:
             return None, "Error in arithmetic evaluation"
     
-    encoding = tokenizer(query, return_tensors="pt")
-    teacher_embed = text_encoder(encoding["input_ids"], attention_mask=encoding.get("attention_mask"))
-    teacher_embed = teacher_embed.squeeze(0)
-    teacher_embed = teacher_embed / teacher_embed.norm()
+    teacher_embed = get_teacher_embedding(query, text_encoder)
     input_tensor = proj_in_layer(teacher_embed)
+    
     with torch.no_grad():
-        student_output = model(input_tensor.unsqueeze(0))
+        student_output = model(input_tensor.unsqueeze(0))  # [1, 32]
         student_output = student_output / student_output.norm(dim=1, keepdim=True)
+    
     with torch.no_grad():
         generated_ids = decoder.generate(student_output, device=torch.device("cpu"), temperature=1.0)
     generated_ids = generated_ids[0].tolist()
@@ -314,19 +282,23 @@ def run_interactive(model, decoder, text_encoder):
             print(f"Error processing query: {e}\n")
 
 # -----------------------------
-# Test Mode (Runs Predefined Set of 9 Questions)
+# Test Mode (Runs Predefined Test Questions)
 # -----------------------------
 def run_test(model, decoder, text_encoder):
     test_questions = [
         "Hello",
-        "Can you help me?",
-        "That's odd",
+        "What is the capital of Australia?",
+        "Who is the presiunt of the united states of america?",
+        "Why is the sky blue?",
+        "When was the Battle of Hastings?",
         "2+2",
         "5+1",
         "3-1",
+        "6-8",
         "2*2",
-        "2/2",
-        "What is the capital of Australia?"
+        "5*5",
+        "144*12",
+        "2/2"
     ]
     print("\nThe following test questions will be run:")
     for i, q in enumerate(test_questions, start=1):
@@ -371,85 +343,71 @@ def mark_book_as_trained(book_path):
 # -----------------------------
 # Other Training Modules
 # -----------------------------
-def train_on_squad(model, num_epochs=5, batch_size=32):
+def train_on_squad(model, num_epochs=5, batch_size=32, text_encoder=None):
     df = load_squad_data()
     optimizer = optim.Adam(list(model.parameters()) + list(proj_in_layer.parameters()), lr=0.001)
     criterion = nn.MSELoss()
     model.train()
-    with tqdm(total=num_epochs, desc="SQuAD Training", unit="epoch") as pbar:
-        for epoch in range(num_epochs):
-            batch = df.sample(batch_size)
-            questions = batch["question"].tolist()
-            answers = batch["answer"].tolist()
-            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(q))["embedding"] for q in questions]
-            q_embeds = torch.tensor(q_embeds, dtype=torch.float32)
-            if q_embeds.ndim == 1:
-                q_embeds = q_embeds.unsqueeze(0)
-            q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
-            inputs = proj_in_layer(q_embeds).to(device)
-            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(a))["embedding"] for a in answers]
-            a_embeds = torch.tensor(a_embeds, dtype=torch.float32).to(device)
-            if a_embeds.ndim == 1:
-                a_embeds = a_embeds.unsqueeze(0)
-            a_embeds = a_embeds / torch.norm(a_embeds, dim=1, keepdim=True)
-            targets = proj_out_layer(a_embeds)
-            targets = targets / targets.norm(dim=1, keepdim=True)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            outputs = outputs / outputs.norm(dim=1, keepdim=True)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            pbar.set_postfix({"loss": loss.item()})
-            pbar.update(1)
+    for epoch in tqdm(range(num_epochs), desc="SQuAD Training", unit="epoch"):
+        batch = df.sample(batch_size)
+        questions = batch["question"].tolist()
+        answers = batch["answer"].tolist()
+        q_embeds = [get_teacher_embedding(str(q), text_encoder) for q in questions]
+        q_embeds = torch.stack(q_embeds)
+        q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
+        inputs = proj_in_layer(q_embeds).to(device)
+        a_embeds = [get_teacher_embedding(str(a), text_encoder) for a in answers]
+        a_embeds = torch.stack(a_embeds).to(device)
+        a_embeds = a_embeds / torch.norm(a_embeds, dim=1, keepdim=True)
+        targets = proj_out_layer(a_embeds)
+        targets = targets / targets.norm(dim=1, keepdim=True)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        outputs = outputs / outputs.norm(dim=1, keepdim=True)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
     log_training("SQuAD Fine-Tuning", num_epochs)
     print("SQuAD fine-tuning completed.")
 
-def train_on_arithmetic(model, num_epochs=5, batch_size=32):
+def train_on_arithmetic(model, num_epochs=5, batch_size=32, text_encoder=None):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
     model.train()
-    with tqdm(total=num_epochs, desc="Arithmetic Training", unit="epoch") as pbar:
-        for epoch in range(num_epochs):
-            questions, answers = [], []
-            for _ in range(batch_size):
-                a = random.randint(1, 100)
-                b = random.randint(1, 100)
-                op = random.choice(["+", "-", "*", "/"])
-                if op == "/":
-                    a = a * b
-                    q = f"{a} / {b}"
-                    a_text = str(a // b)
-                else:
-                    q = f"{a} {op} {b}"
-                    a_text = str(eval(q))
-                questions.append(q)
-                answers.append(a_text)
-            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(q))["embedding"] for q in questions]
-            q_embeds = torch.tensor(q_embeds, dtype=torch.float32)
-            if q_embeds.ndim == 1:
-                q_embeds = q_embeds.unsqueeze(0)
-            q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
-            inputs = proj_in_layer(q_embeds).to(device)
-            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(a))["embedding"] for a in answers]
-            a_embeds = torch.tensor(a_embeds, dtype=torch.float32).to(device)
-            if a_embeds.ndim == 1:
-                a_embeds = a_embeds.unsqueeze(0)
-            a_embeds = a_embeds / torch.norm(a_embeds, dim=1, keepdim=True)
-            targets = proj_out_layer(a_embeds)
-            targets = targets / targets.norm(dim=1, keepdim=True)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            outputs = outputs / outputs.norm(dim=1, keepdim=True)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            pbar.set_postfix({"loss": loss.item()})
-            pbar.update(1)
+    for epoch in tqdm(range(num_epochs), desc="Arithmetic Training", unit="epoch"):
+        questions, answers = [], []
+        for _ in range(batch_size):
+            a = random.randint(1, 100)
+            b = random.randint(1, 100)
+            op = random.choice(["+", "-", "*", "/"])
+            if op == "/":
+                a = a * b
+                q = f"{a} / {b}"
+                a_text = str(a // b)
+            else:
+                q = f"{a} {op} {b}"
+                a_text = str(eval(q))
+            questions.append(q)
+            answers.append(a_text)
+        q_embeds = [get_teacher_embedding(str(q), text_encoder) for q in questions]
+        q_embeds = torch.stack(q_embeds)
+        q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
+        inputs = proj_in_layer(q_embeds).to(device)
+        a_embeds = [get_teacher_embedding(str(a), text_encoder) for a in answers]
+        a_embeds = torch.stack(a_embeds).to(device)
+        a_embeds = a_embeds / torch.norm(a_embeds, dim=1, keepdim=True)
+        targets = proj_out_layer(a_embeds)
+        targets = targets / targets.norm(dim=1, keepdim=True)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        outputs = outputs / outputs.norm(dim=1, keepdim=True)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
     log_training("Arithmetic Fine-Tuning", num_epochs)
     print("Arithmetic fine-tuning completed.")
 
-def train_on_book_file(model, book_path, num_epochs=5, batch_size=16):
+def train_on_book_file(model, book_path, num_epochs=5, batch_size=16, text_encoder=None):
     try:
         with open(book_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -470,38 +428,33 @@ def train_on_book_file(model, book_path, num_epochs=5, batch_size=16):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
     model.train()
-    with tqdm(total=num_epochs, desc=f"Book Training ({os.path.basename(book_path)})", unit="epoch") as pbar:
-        for epoch in range(num_epochs):
-            batch = random.sample(paragraphs, min(batch_size, len(paragraphs)))
-            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(p))["embedding"] for p in batch]
-            q_embeds = torch.tensor(q_embeds, dtype=torch.float32)
-            if q_embeds.ndim == 1:
-                q_embeds = q_embeds.unsqueeze(0)
-            q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
-            inputs = proj_in_layer(q_embeds).to(device)
-            targets = proj_out_layer(q_embeds).to(device)
-            targets = targets / targets.norm(dim=1, keepdim=True)
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            outputs = outputs / outputs.norm(dim=1, keepdim=True)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            pbar.set_postfix({"loss": loss.item()})
-            pbar.update(1)
+    for epoch in tqdm(range(num_epochs), desc=f"Book Training ({os.path.basename(book_path)})", unit="epoch"):
+        batch = random.sample(paragraphs, min(batch_size, len(paragraphs)))
+        q_embeds = [get_teacher_embedding(str(p), text_encoder) for p in batch]
+        q_embeds = torch.stack(q_embeds)
+        q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
+        inputs = proj_in_layer(q_embeds).to(device)
+        targets = proj_out_layer(q_embeds).to(device)
+        targets = targets / targets.norm(dim=1, keepdim=True)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        outputs = outputs / outputs.norm(dim=1, keepdim=True)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
     log_training(f"Book Fine-Tuning ({os.path.basename(book_path)})", num_epochs)
     mark_book_as_trained(book_path)
     print(f"Book training on {book_path} completed.")
 
-def train_on_all_unseen_books(model, num_epochs=5, batch_size=16):
+def train_on_all_unseen_books(model, num_epochs=5, batch_size=16, text_encoder=None):
     unseen_books = get_unseen_books()
     if not unseen_books:
         print("No unseen books found in the 'books' directory.")
         return
     for book in unseen_books:
-        train_on_book_file(model, book, num_epochs=num_epochs, batch_size=batch_size)
+        train_on_book_file(model, book, num_epochs=num_epochs, batch_size=batch_size, text_encoder=text_encoder)
 
-def train_free_text_qa(model, decoder, num_epochs=5, batch_size=32, lambda_embed=0.5):
+def train_free_text_qa(model, decoder, num_epochs=5, batch_size=32, lambda_embed=0.5, text_encoder=None):
     df = load_teacher_qa_data()
     optimizer = optim.Adam(list(model.parameters()) + list(decoder.parameters()) +
                              list(proj_in_layer.parameters()) + list(proj_out_layer.parameters()), lr=0.001)
@@ -509,59 +462,44 @@ def train_free_text_qa(model, decoder, num_epochs=5, batch_size=32, lambda_embed
     ce_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100)
     model.train()
     decoder.train()
-    with tqdm(total=num_epochs, desc="Free Text QA Training", unit="epoch") as pbar:
-        for epoch in range(num_epochs):
-            batch = df.sample(batch_size)
-            questions = batch["question"].tolist()
-            answers = batch["answer"].tolist()
-            # Ensure all inputs are strings
-            questions = [str(q) for q in questions]
-            answers = [str(a) for a in answers]
-            q_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=q)["embedding"] for q in questions]
-            q_embeds = torch.tensor(q_embeds, dtype=torch.float32)
-            if q_embeds.ndim == 1:
-                q_embeds = q_embeds.unsqueeze(0)
-            q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
-            inputs = proj_in_layer(q_embeds).to(device)
-            student_out = model(inputs)
-            student_out = student_out / student_out.norm(dim=1, keepdim=True)
-            target_texts = [tokenizer.bos_token + a + tokenizer.eos_token for a in answers]
-            target_encodings = tokenizer(target_texts, return_tensors="pt", padding=True, truncation=True)
-            target_ids = target_encodings["input_ids"].to(device)
-            logits = decoder(student_out, target_ids[:, :-1])
-            loss_ce = ce_criterion(logits.reshape(-1, logits.size(-1)), target_ids[:, 1:].reshape(-1))
-            a_embeds = [ollama.embeddings(model="mistral:7b-instruct-q4_0", prompt=str(a))["embedding"] for a in answers]
-            a_embeds = torch.tensor(a_embeds, dtype=torch.float32).to(device)
-            if a_embeds.ndim == 1:
-                a_embeds = a_embeds.unsqueeze(0)
-            a_embeds = a_embeds / torch.norm(a_embeds, dim=1, keepdim=True)
-            teacher_answer_embeds = proj_out_layer(a_embeds)
-            teacher_answer_embeds = teacher_answer_embeds / teacher_answer_embeds.norm(dim=1, keepdim=True)
-            loss_mse = mse_criterion(student_out, teacher_answer_embeds)
-            loss = loss_ce + lambda_embed * loss_mse
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            pbar.set_postfix({"loss": loss.item(), "CE": loss_ce.item(), "MSE": loss_mse.item()})
-            pbar.update(1)
+    for epoch in tqdm(range(num_epochs), desc="Free Text QA Training", unit="epoch"):
+        batch = df.sample(batch_size)
+        questions = [str(q) for q in batch["question"].tolist()]
+        answers = [str(a) for a in batch["answer"].tolist()]
+        q_embeds = [get_teacher_embedding(q, text_encoder) for q in questions]
+        q_embeds = torch.stack(q_embeds)
+        q_embeds = q_embeds / torch.norm(q_embeds, dim=1, keepdim=True)
+        inputs = proj_in_layer(q_embeds).to(device)
+        student_out = model(inputs)
+        student_out = student_out / student_out.norm(dim=1, keepdim=True)
+        target_texts = [tokenizer.bos_token + a + tokenizer.eos_token for a in answers]
+        target_encodings = tokenizer(target_texts, return_tensors="pt", padding=True, truncation=True)
+        target_ids = target_encodings["input_ids"].to(device)
+        logits = decoder(student_out, target_ids[:, :-1])
+        loss_ce = ce_criterion(logits.reshape(-1, logits.size(-1)), target_ids[:, 1:].reshape(-1))
+        a_embeds = [get_teacher_embedding(a, text_encoder) for a in answers]
+        a_embeds = torch.stack(a_embeds).to(device)
+        a_embeds = a_embeds / torch.norm(a_embeds, dim=1, keepdim=True)
+        teacher_answer_embeds = proj_out_layer(a_embeds)
+        teacher_answer_embeds = teacher_answer_embeds / teacher_answer_embeds.norm(dim=1, keepdim=True)
+        loss_mse = mse_criterion(student_out, teacher_answer_embeds)
+        loss = loss_ce + lambda_embed * loss_mse
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
     log_training("Free Text QA Fine-Tuning", num_epochs)
     print("Free Text QA fine-tuning completed.")
 
-def train_rl_finetune(model, decoder, text_encoder, num_epochs=5, batch_size=16):
+def train_rl_finetune(model, decoder, num_epochs=5, batch_size=16, text_encoder=None):
     df = load_squad_data()
     optimizer = optim.Adam(decoder.parameters(), lr=1e-5)
     for epoch in range(num_epochs):
         total_loss = 0.0
         batch = df.sample(batch_size)
-        questions = batch["question"].tolist()
-        ground_truths = batch["answer"].tolist()
+        questions = [str(q) for q in batch["question"].tolist()]
+        ground_truths = [str(a) for a in batch["answer"].tolist()]
         for q, gt in zip(questions, ground_truths):
-            q = str(q)
-            gt = str(gt)
-            encoding = tokenizer(q, return_tensors="pt")
-            teacher_embed = text_encoder(encoding["input_ids"], attention_mask=encoding.get("attention_mask"))
-            teacher_embed = teacher_embed.squeeze(0)
-            teacher_embed = teacher_embed / teacher_embed.norm()
+            teacher_embed = get_teacher_embedding(q, text_encoder)
             input_tensor = proj_in_layer(teacher_embed)
             with torch.no_grad():
                 student_output = model(input_tensor.unsqueeze(0))
@@ -616,44 +554,67 @@ def main_menu():
     return choice.strip()
 
 # -----------------------------
+# Pretrain Decoder Function
+# -----------------------------
+def pretrain_decoder(decoder, text_file="pretrain_text.txt", epochs=5, batch_size=32):
+    if not os.path.exists(text_file):
+        print(f"Pretraining text file {text_file} not found.")
+        return
+    print("Loading pretraining data...")
+    with open(text_file, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+    encodings = tokenizer(lines, return_tensors="pt", padding=True, truncation=True)
+    input_ids = encodings["input_ids"].to(device)
+    optimizer = optim.Adam(decoder.parameters(), lr=0.001)
+    ce_criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100)
+    decoder.train()
+    num_batches = len(input_ids) // batch_size
+    print("Starting decoder pretraining...")
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for i in tqdm(range(num_batches), desc=f"Pretraining Epoch {epoch+1}"):
+            batch_ids = input_ids[i*batch_size:(i+1)*batch_size]
+            inputs = batch_ids[:, :-1]
+            targets = batch_ids[:, 1:]
+            dummy_embedding = torch.zeros((batch_ids.size(0), 32), device=device)
+            logits = decoder(dummy_embedding, inputs)
+            loss = ce_criterion(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        print(f"Pretraining Epoch {epoch+1}: Loss = {epoch_loss/num_batches:.4f}")
+    decoder.eval()
+    print("Decoder pretraining completed.")
+
+# -----------------------------
 # Main Execution
 # -----------------------------
 if __name__ == "__main__":
-    device = torch.device("cpu")
-    student_model = AstraeaTernaryNet().to(device)
-    checkpoint = "astraea_distilled.pth"
-    if os.path.exists(checkpoint):
-        try:
-            student_model.load_state_dict(torch.load(checkpoint, map_location=device, weights_only=True))
-            student_model.eval()
-            print(f"Loaded student model from {checkpoint}")
-        except Exception as e:
-            print(f"Error loading checkpoint: {e}")
-    else:
-        print("No checkpoint found; training will start from scratch.")
-    # Main training menu loop
+    text_encoder = load_text_encoder()
+    student_model = load_student_model("astraea_distilled.pth")
+    decoder = load_decoder()
     while True:
         choice = main_menu()
         if choice == "1":
-            train_on_squad(student_model, num_epochs=5, batch_size=32)
+            train_on_squad(student_model, num_epochs=5, batch_size=32, text_encoder=text_encoder)
         elif choice == "2":
-            train_on_arithmetic(student_model, num_epochs=5, batch_size=32)
+            train_on_arithmetic(student_model, num_epochs=5, batch_size=32, text_encoder=text_encoder)
         elif choice == "3":
-            train_on_all_unseen_books(student_model, num_epochs=5, batch_size=16)
+            train_on_all_unseen_books(student_model, num_epochs=5, batch_size=16, text_encoder=text_encoder)
         elif choice == "4":
-            train_free_text_qa(student_model, load_decoder(), num_epochs=5, batch_size=32, lambda_embed=0.5)
+            train_free_text_qa(student_model, decoder, num_epochs=5, batch_size=32, lambda_embed=0.5, text_encoder=text_encoder)
         elif choice == "5":
-            train_rl_finetune(student_model, load_decoder(), load_text_encoder(), num_epochs=5, batch_size=16)
+            train_rl_finetune(student_model, decoder, num_epochs=5, batch_size=16, text_encoder=text_encoder)
         elif choice == "7":
             print("Running all training modules sequentially...")
-            train_on_squad(student_model, num_epochs=5, batch_size=32)
-            train_on_arithmetic(student_model, num_epochs=5, batch_size=32)
-            train_on_all_unseen_books(student_model, num_epochs=5, batch_size=16)
-            train_free_text_qa(student_model, load_decoder(), num_epochs=5, batch_size=32, lambda_embed=0.5)
-            train_rl_finetune(student_model, load_decoder(), load_text_encoder(), num_epochs=5, batch_size=16)
+            train_on_squad(student_model, num_epochs=5, batch_size=32, text_encoder=text_encoder)
+            train_on_arithmetic(student_model, num_epochs=5, batch_size=32, text_encoder=text_encoder)
+            train_on_all_unseen_books(student_model, num_epochs=5, batch_size=16, text_encoder=text_encoder)
+            train_free_text_qa(student_model, decoder, num_epochs=5, batch_size=32, lambda_embed=0.5, text_encoder=text_encoder)
+            train_rl_finetune(student_model, decoder, num_epochs=5, batch_size=16, text_encoder=text_encoder)
         elif choice == "8":
             print("Pretraining the decoder on pretrain_text.txt...")
-            decoder = load_decoder()
             pretrain_decoder(decoder, text_file="pretrain_text.txt", epochs=5, batch_size=32)
         elif choice == "6":
             print("Exiting training module.")
